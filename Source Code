@@ -1,0 +1,316 @@
+from flask import Flask, request, redirect, url_for, render_template_string, send_file, flash
+from pymongo import MongoClient
+from bson.objectid import ObjectId
+from datetime import datetime
+import io
+import pandas as pd
+
+# ===== Configuration =====
+MONGO_URI = "mongodb://localhost:27017"
+DB_NAME = "inventory_db"
+PRODUCTS_COLLECTION = "products"
+SALES_COLLECTION = "sales"
+
+app = Flask(__name__)
+app.secret_key = "dev-secret-change-me"
+
+# ===== MongoDB Setup =====
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+products_col = db[PRODUCTS_COLLECTION]
+sales_col = db[SALES_COLLECTION]
+
+# Create indices for faster lookups (run once)
+products_col.create_index([("name", 1)])
+
+# ===== Helper functions =====
+
+def product_doc_to_dict(doc):
+    return {
+        "_id": str(doc.get("_id")),
+        "name": doc.get("name"),
+        "category": doc.get("category"),
+        "price": doc.get("price"),
+        "stock": doc.get("stock"),
+        "min_stock": doc.get("min_stock", 0),
+        "last_updated": doc.get("last_updated")
+    }
+
+# ===== Routes =====
+
+HOME_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>Inventory Management</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; }
+    th { background: #f4f4f4; }
+    form { margin: 0; }
+    .actions { display:flex; gap:6px; }
+    .small { font-size: 0.9em; }
+    .notice { color: green; }
+    .alert { color: red; }
+  </style>
+</head>
+<body>
+  <h1>Inventory Management</h1>
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}
+      <ul>
+      {% for m in messages %}
+        <li class="notice">{{ m }}</li>
+      {% endfor %}
+      </ul>
+    {% endif %}
+  {% endwith %}
+  <p>
+    <a href="{{ url_for('add_product') }}">Add Product</a> | 
+    <a href="{{ url_for('low_stock') }}">Low Stock</a> |
+    <a href="{{ url_for('export_csv') }}">Export CSV</a>
+  </p>
+  <form method="get" action="{{ url_for('home') }}">
+    <input type="text" name="q" placeholder="Search by name or category" value="{{ request.args.get('q','') }}">
+    <select name="sort">
+      <option value="name" {% if request.args.get('sort')=='name' %}selected{% endif %}>Sort: Name</option>
+      <option value="stock" {% if request.args.get('sort')=='stock' %}selected{% endif %}>Sort: Stock</option>
+      <option value="price" {% if request.args.get('sort')=='price' %}selected{% endif %}>Sort: Price</option>
+    </select>
+    <button type="submit">Filter</button>
+  </form>
+  <hr>
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Category</th><th>Price</th><th>Stock</th><th>Min Stock</th><th>Last Updated</th><th>Actions</th></tr>
+    </thead>
+    <tbody>
+      {% for p in products %}
+      <tr>
+        <td>{{ p.name }}</td>
+        <td>{{ p.category }}</td>
+        <td>{{ p.price }}</td>
+        <td{% if p.stock <= p.min_stock %} class="alert"{% endif %}>{{ p.stock }}</td>
+        <td>{{ p.min_stock }}</td>
+        <td class="small">{{ p.last_updated }}</td>
+        <td class="actions">
+          <a href="{{ url_for('edit_product', pid=p._id) }}">Edit</a>
+          <form method="post" action="{{ url_for('sell_product', pid=p._id) }}" style="display:inline-block">
+            <input type="number" name="qty" value="1" min="1" style="width:60px">
+            <button type="submit">Sell</button>
+          </form>
+          <form method="post" action="{{ url_for('delete_product', pid=p._id) }}" onsubmit="return confirm('Delete product?')" style="display:inline-block">
+            <button type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>
+"""
+
+@app.route('/')
+def home():
+    q = request.args.get('q', '').strip()
+    sort = request.args.get('sort', 'name')
+
+    query = {}
+    if q:
+        # simple case-insensitive search on name or category
+        query = {"$or": [{"name": {"$regex": q, "$options": "i"}}, {"category": {"$regex": q, "$options": "i"}}]}
+
+    sort_map = {
+        "name": ("name", 1),
+        "stock": ("stock", -1),
+        "price": ("price", -1)
+    }
+    sort_field, sort_dir = sort_map.get(sort, ("name", 1))
+
+    cursor = products_col.find(query).sort(sort_field, sort_dir)
+    products = [product_doc_to_dict(d) for d in cursor]
+    # format last_updated
+    for p in products:
+        lu = p.get('last_updated')
+        p['last_updated'] = lu.strftime('%Y-%m-%d %H:%M') if lu else ''
+
+    return render_template_string(HOME_TEMPLATE, products=products)
+
+# ===== Add product =====
+ADD_TEMPLATE = """
+<!doctype html>
+<title>Add Product</title>
+<h2>Add Product</h2>
+<form method="post">
+  <label>Name: <input name="name" required></label><br>
+  <label>Category: <input name="category"></label><br>
+  <label>Price: <input name="price" type="number" step="0.01" value="0"></label><br>
+  <label>Stock: <input name="stock" type="number" value="0"></label><br>
+  <label>Min Stock: <input name="min_stock" type="number" value="5"></label><br>
+  <button type="submit">Add</button>
+</form>
+<p><a href="{{ url_for('home') }}">Back</a></p>
+"""
+
+@app.route('/add', methods=['GET', 'POST'])
+def add_product():
+    if request.method == 'POST':
+        name = request.form['name'].strip()
+        category = request.form.get('category','').strip()
+        price = float(request.form.get('price') or 0)
+        stock = int(request.form.get('stock') or 0)
+        min_stock = int(request.form.get('min_stock') or 0)
+
+        doc = {
+            'name': name,
+            'category': category,
+            'price': price,
+            'stock': stock,
+            'min_stock': min_stock,
+            'last_updated': datetime.utcnow()
+        }
+        products_col.insert_one(doc)
+        flash('Product added')
+        return redirect(url_for('home'))
+    return render_template_string(ADD_TEMPLATE)
+
+# ===== Edit product =====
+EDIT_TEMPLATE = """
+<!doctype html>
+<title>Edit Product</title>
+<h2>Edit Product</h2>
+<form method="post">
+  <label>Name: <input name="name" value="{{ p.name }}" required></label><br>
+  <label>Category: <input name="category" value="{{ p.category }}"></label><br>
+  <label>Price: <input name="price" type="number" step="0.01" value="{{ p.price }}"></label><br>
+  <label>Stock: <input name="stock" type="number" value="{{ p.stock }}"></label><br>
+  <label>Min Stock: <input name="min_stock" type="number" value="{{ p.min_stock }}"></label><br>
+  <button type="submit">Save</button>
+</form>
+<p><a href="{{ url_for('home') }}">Back</a></p>
+"""
+
+@app.route('/edit/<pid>', methods=['GET','POST'])
+def edit_product(pid):
+    doc = products_col.find_one({"_id": ObjectId(pid)})
+    if not doc:
+        flash('Product not found')
+        return redirect(url_for('home'))
+    if request.method == 'POST':
+        name = request.form['name'].strip()
+        category = request.form.get('category','').strip()
+        price = float(request.form.get('price') or 0)
+        stock = int(request.form.get('stock') or 0)
+        min_stock = int(request.form.get('min_stock') or 0)
+
+        products_col.update_one({"_id": ObjectId(pid)}, {"$set": {
+            'name': name,
+            'category': category,
+            'price': price,
+            'stock': stock,
+            'min_stock': min_stock,
+            'last_updated': datetime.utcnow()
+        }})
+        flash('Product updated')
+        return redirect(url_for('home'))
+
+    p = product_doc_to_dict(doc)
+    return render_template_string(EDIT_TEMPLATE, p=p)
+
+# ===== Delete product =====
+@app.route('/delete/<pid>', methods=['POST'])
+def delete_product(pid):
+    products_col.delete_one({"_id": ObjectId(pid)})
+    flash('Product deleted')
+    return redirect(url_for('home'))
+
+# ===== Sell product (record sale, decrement stock) =====
+@app.route('/sell/<pid>', methods=['POST'])
+def sell_product(pid):
+    qty = int(request.form.get('qty') or 1)
+
+    # atomically decrement stock if enough
+    res = products_col.find_one_and_update(
+        {"_id": ObjectId(pid), "stock": {"$gte": qty}},
+        {"$inc": {"stock": -qty}, "$set": {"last_updated": datetime.utcnow()}},
+        return_document=False
+    )
+    if not res:
+        flash('Not enough stock or product not found')
+        return redirect(url_for('home'))
+
+    # record sale
+    sale_doc = {
+        'product_id': ObjectId(pid),
+        'quantity': qty,
+        'price': res.get('price', 0),
+        'total': qty * res.get('price', 0),
+        'sold_at': datetime.utcnow()
+    }
+    sales_col.insert_one(sale_doc)
+    flash('Sale recorded')
+    return redirect(url_for('home'))
+
+# ===== Low stock view =====
+LOW_TEMPLATE = """
+<!doctype html>
+<title>Low Stock</title>
+<h2>Low Stock Products</h2>
+<p><a href="{{ url_for('home') }}">Back</a></p>
+<table>
+  <thead><tr><th>Name</th><th>Stock</th><th>Min Stock</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for p in products %}
+    <tr>
+      <td>{{ p.name }}</td>
+      <td>{{ p.stock }}</td>
+      <td>{{ p.min_stock }}</td>
+      <td><a href="{{ url_for('edit_product', pid=p._id) }}">Edit</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+"""
+
+@app.route('/low')
+def low_stock():
+    cursor = products_col.find({"$expr": {"$lte": ["$stock", "$min_stock"]}})
+    products = [product_doc_to_dict(d) for d in cursor]
+    return render_template_string(LOW_TEMPLATE, products=products)
+
+# ===== Export CSV =====
+@app.route('/export')
+def export_csv():
+    cursor = products_col.find()
+    rows = []
+    for d in cursor:
+        rows.append({
+            'id': str(d.get('_id')),
+            'name': d.get('name'),
+            'category': d.get('category'),
+            'price': d.get('price'),
+            'stock': d.get('stock'),
+            'min_stock': d.get('min_stock', 0),
+            'last_updated': d.get('last_updated')
+        })
+    df = pd.DataFrame(rows)
+    # convert datetimes to string
+    if 'last_updated' in df.columns:
+        df['last_updated'] = df['last_updated'].apply(lambda x: x.strftime('%Y-%m-%d %H:%M') if pd.notnull(x) else '')
+
+    csv_io = io.StringIO()
+    df.to_csv(csv_io, index=False)
+    csv_io.seek(0)
+
+    return send_file(io.BytesIO(csv_io.getvalue().encode('utf-8')),
+                     mimetype='text/csv',
+                     as_attachment=True,
+                     download_name='products.csv')
+
+
+# ===== Run server =====
+if __name__ == '__main__':
+    app.run(debug=True)
