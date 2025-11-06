@@ -1,0 +1,3 @@
+The Inventory Management System is a web-based application designed to efficiently manage product information, track sales, and monitor stock levels in real-time. The application enables users to add, edit, sell, delete, and view products through a simple and interactive web interface.
+Traditional inventory management relies heavily on manual tracking, which is error-prone and time-consuming. This project leverages Flask, a lightweight Python web framework, and MongoDB, a NoSQL database, to create a modern, flexible, and scalable solution.
+This system ensures better accuracy in maintaining stock records, provides instant updates when items fall below minimum stock levels, and allows exporting product data in CSV format for reporting or backup purposes.
